@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 
-# --- カラム定義 ---
+# --- カラム定義（環境に合わせて調整可能） ---
 PLAN_MAT_COL = "品目コード"
 PLAN_PROD_COL = "製品記号"
 PLAN_START_COL = "製造開始日"
@@ -18,6 +18,7 @@ MASTER_DESC_COL = "Component Description"
 MASTER_COMP_NUM_COL = "Component Number"
 
 def get_plan_data(uploaded_file):
+    """Excelの指定シートからRow 6以降を取得"""
     if uploaded_file is None: return {}
     plans_dict = {}
     xls = pd.ExcelFile(uploaded_file, engine='openpyxl')
@@ -32,6 +33,7 @@ def get_plan_data(uploaded_file):
     return plans_dict
 
 def compute_necessary_qty(row, plan_qty):
+    """BOTTLE/PUMP判定を含む数量計算ロジック"""
     desc = str(row.get(MASTER_DESC_COL, '')).upper()
     if "BOTTLE" in desc or "PUMP" in desc:
         return plan_qty
@@ -40,55 +42,66 @@ def compute_necessary_qty(row, plan_qty):
     if pd.isna(p_qty) or p_qty == 0: return 0
     return (plan_qty / p_qty) * c_qty
 
-def process_bom_structure(plan_df, cu_df, du_df):
-    """親と子(VERP)を紐付け、1つの構造化されたリストを返す"""
+def create_structured_bom(plan_df, cu_df, du_df):
+    """親品目の直後に子品目(VERP)を配置したリストを作成"""
     if plan_df.empty: return pd.DataFrame()
 
-    # マスタのクリーニング
+    # マスタをVERPのみに事前フィルタ
+    masters = []
     for df in [cu_df, du_df]:
-        if MATERIAL_TYPE_COL in df.columns:
-            df.query(f"`{MATERIAL_TYPE_COL}` == '{TARGET_TYPE}'", inplace=True)
-
-    results = []
-    for _, row in plan_df.iterrows():
-        # 1. 親品目自体を登録
-        parent_info = {
-            PLAN_MAT_COL: row[PLAN_MAT_COL],
-            PLAN_PROD_COL: row[PLAN_PROD_COL],
-            PLAN_START_COL: row[PLAN_START_COL],
-            'Component Number': row[PLAN_MAT_COL],
-            'Component Description': "(Parent Item)",
-            'Plan Quantity': row[PLAN_QTY_COL],
-            'Necessary Quantity': row[PLAN_QTY_COL],
-            'Sort Key': 0
-        }
-        results.append(parent_info)
-
-        # 2. CU/DUから子品目を抽出
-        prod_code = str(row[PLAN_PROD_COL]).strip()
-        for m_df in [cu_df, du_df]:
-            if MASTER_KEY in m_df.columns:
-                children = m_df[m_df[MASTER_KEY].astype(str) == prod_code]
-                for _, child in children.iterrows():
-                    results.append({
-                        PLAN_MAT_COL: row[PLAN_MAT_COL],
-                        PLAN_PROD_COL: row[PLAN_PROD_COL],
-                        PLAN_START_COL: row[PLAN_START_COL],
-                        'Component Number': child[MASTER_COMP_NUM_COL],
-                        'Component Description': child[MASTER_DESC_COL],
-                        'Plan Quantity': row[PLAN_QTY_COL],
-                        'Necessary Quantity': compute_necessary_qty(child, row[PLAN_QTY_COL]),
-                        'Sort Key': 1
-                    })
+        if df is not None and not df.empty:
+            if MATERIAL_TYPE_COL in df.columns:
+                masters.append(df[df[MATERIAL_TYPE_COL] == TARGET_TYPE].copy())
+            else:
+                masters.append(df.copy())
     
-    return pd.DataFrame(results)
+    full_master = pd.concat(masters, ignore_index=True) if masters else pd.DataFrame()
+    if not full_master.empty:
+        full_master[MASTER_KEY] = full_master[MASTER_KEY].astype(str).str.strip()
+
+    structured_data = []
+    for _, row in plan_df.iterrows():
+        parent_mat = str(row[PLAN_MAT_COL]).strip()
+        plan_qty = row[PLAN_QTY_COL]
+
+        # 1. 親品目行の追加
+        parent_row = {
+            'Material Code': parent_mat,
+            'Product Code': row[PLAN_PROD_COL],
+            'Production Start': row[PLAN_START_COL],
+            'Component Number': parent_mat,
+            'Component Description': "(Parent Item)",
+            'Plan Quantity': plan_qty,
+            'Necessary Quantity': plan_qty,
+            'Sort Order': 0 # 親
+        }
+        structured_data.append(parent_row)
+
+        # 2. CU/DUマスタから、この親の品目コードに紐づく子を検索
+        if not full_master.empty:
+            children = full_master[full_master[MASTER_KEY] == parent_mat]
+            for _, child in children.iterrows():
+                child_row = {
+                    'Material Code': parent_mat,
+                    'Product Code': row[PLAN_PROD_COL],
+                    'Production Start': row[PLAN_START_COL],
+                    'Component Number': child[MASTER_COMP_NUM_COL],
+                    'Component Description': child[MASTER_DESC_COL],
+                    'Plan Quantity': plan_qty,
+                    'Necessary Quantity': compute_necessary_qty(child, plan_qty),
+                    'Sort Order': 1 # 子
+                }
+                structured_data.append(child_row)
+
+    return pd.DataFrame(structured_data)
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="SAP PO Auditor Pro", layout="wide")
-st.title("📊 SAP製造指示 階層型監査レポート作成")
+st.set_page_config(page_title="SAP Audit Tool V5", layout="wide")
+st.title("📊 SAP監査レポート (親・子 階層構造版)")
+st.info("親品目のすぐ下に、CU/DUリストから抽出された子品目(VERP)が自動で並びます。")
 
 with st.sidebar:
-    st.header("1. マスタ読み込み")
+    st.header("1. マスタデータ")
     cu_file = st.file_uploader("CUリスト", type=["xlsx"])
     du_file = st.file_uploader("DUリスト", type=["xlsx"])
 
@@ -98,9 +111,9 @@ with col1:
 with col2:
     new_file = st.file_uploader("新計画ファイル (.xlsm)", type=["xlsm", "xlsx"])
 
-if st.button("🔍 レポートを生成"):
+if st.button("🔍 比較レポートを作成"):
     if not (cu_file and du_file and old_file and new_file):
-        st.error("ファイルをすべてアップロードしてください。")
+        st.error("すべてのファイルをアップロードしてください。")
     else:
         try:
             cu_m = pd.read_excel(cu_file)
@@ -113,38 +126,44 @@ if st.button("🔍 レポートを生成"):
 
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 workbook = writer.book
-                diff_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+                red_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
 
-                for name in all_names:
-                    old_bom = process_bom_structure(old_plans.get(name, pd.DataFrame()), cu_m, du_m)
-                    new_bom = process_bom_structure(new_plans.get(name, pd.DataFrame()), cu_m, du_m)
+                for name in sorted(all_names):
+                    # 各計画ごとに親子構造リストを作成
+                    old_bom = create_structured_bom(old_plans.get(name, pd.DataFrame()), cu_m, du_m)
+                    new_bom = create_structured_bom(new_plans.get(name, pd.DataFrame()), cu_m, du_m)
 
-                    # 旧・新を外部結合（品目、日付、構成品、製品記号で紐付け）
-                    merge_keys = [PLAN_MAT_COL, PLAN_PROD_COL, PLAN_START_COL, 'Component Number']
+                    # 旧と新を外部結合（品目、日付、構成品番号で紐付け）
+                    merge_keys = ['Material Code', 'Production Start', 'Component Number']
                     comparison = pd.merge(old_bom, new_bom, on=merge_keys, how='outer', suffixes=('_旧', '_新'))
 
-                    # 数値・テキストの欠損埋め
-                    comparison.fillna({'Necessary Quantity_旧': 0, 'Necessary Quantity_新': 0, 
-                                      'Plan Quantity_旧': 0, 'Plan Quantity_新': 0,
-                                      'Component Description_旧': '(Deleted)', 'Component Description_新': '(Added)'}, inplace=True)
+                    # 欠損値の穴埋め (削除/追加対応)
+                    comparison['Necessary Quantity_旧'] = comparison['Necessary Quantity_旧'].fillna(0)
+                    comparison['Necessary Quantity_新'] = comparison['Necessary Quantity_新'].fillna(0)
+                    comparison['Product Code_旧'] = comparison['Product Code_旧'].fillna(comparison['Product Code_新'])
+                    comparison['Component Description_旧'] = comparison['Component Description_旧'].fillna('(New Item)')
+                    comparison['Component Description_新'] = comparison['Component Description_新'].fillna('(Deleted Item)')
 
-                    # 並び替え（製品記号 > 日付 > 親品目 > Sort Key）
-                    comparison['Sort_Temp'] = comparison['Sort Key_新'].fillna(comparison['Sort Key_旧'])
-                    comparison.sort_values(by=[PLAN_PROD_COL, PLAN_START_COL, PLAN_MAT_COL, 'Sort_Temp'], inplace=True)
-                    
-                    # 不要なSort列を削除して出力
-                    final_df = comparison.drop(columns=['Sort Key_旧', 'Sort Key_新', 'Sort_Temp'])
+                    # 並び替え: 製品記号 > 日付 > 親品目コード > Sort Order (親0、子1)
+                    # 結合後にSort Orderが2つできるため、統合して使用
+                    comparison['Sort_Key'] = comparison['Sort Order_新'].fillna(comparison['Sort Order_旧'])
+                    comparison = comparison.sort_values(by=['Product Code_旧', 'Production Start', 'Material Code', 'Sort_Key'])
+
+                    # 不要な列を整理して出力
+                    final_df = comparison.drop(columns=['Sort Order_旧', 'Sort Order_新', 'Sort_Key'])
                     
                     safe_name = str(name)[:31].translate(str.maketrans("", "", r"[]:*?/\\"))
                     final_df.to_excel(writer, index=False, sheet_name=safe_name)
 
-                    # 差異行のハイライト（Necessary Quantityの差）
+                    # 数量に差がある行をハイライト
                     worksheet = writer.sheets[safe_name]
                     for i, row in enumerate(final_df.itertuples()):
-                        if abs(row._6 - row._10) > 0.1: # インデックスは列数に合わせて調整
-                            worksheet.set_row(i + 1, None, diff_format)
+                        # 必要数量(旧)と(新)の比較
+                        # final_dfの列順に注意 (Necessary Quantity_旧 と _新 の位置)
+                        if abs(row._7 - row._12) > 0.001: 
+                            worksheet.set_row(i + 1, None, red_format)
 
-            st.success("レポートの作成が完了しました。")
-            st.download_button("📥 階層レポートをダウンロード", output.getvalue(), "SAP_PO_Audit_Comparison.xlsx")
+            st.success("レポートが完成しました。")
+            st.download_button("📥 階層型レポートをダウンロード", output.getvalue(), "SAP_PO_Hierarchical_Audit.xlsx")
         except Exception as e:
             st.error(f"システムエラー: {e}")
