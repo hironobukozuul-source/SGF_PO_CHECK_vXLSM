@@ -45,6 +45,7 @@ def create_structured_bom(plan_df, cu_df, du_df):
         if df is not None and not df.empty:
             df[MASTER_KEY] = df[MASTER_KEY].astype(str).str.strip()
             df[MASTER_COMP_NUM_COL] = df[MASTER_COMP_NUM_COL].astype(str).str.strip()
+            df[MASTER_DESC_COL] = df[MASTER_DESC_COL].astype(str).str.strip()
 
     structured_data = []
 
@@ -52,7 +53,7 @@ def create_structured_bom(plan_df, cu_df, du_df):
         p_mat = str(row[PLAN_MAT_COL]).strip()
         p_qty = row[PLAN_QTY_COL]
         
-        # 1. 親行の追加
+        # 1. 親行
         structured_data.append({
             'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
             'Comp Number': p_mat, 'Comp Name': "(Parent Item)", 'Need Qty': p_qty, 'Level': 0
@@ -64,19 +65,21 @@ def create_structured_bom(plan_df, cu_df, du_df):
             
             for _, child in du_children.iterrows():
                 comp_num = child[MASTER_COMP_NUM_COL]
-                desc = str(child[MASTER_DESC_COL]).upper()
+                comp_desc = child[MASTER_DESC_COL]
+                desc_upper = comp_desc.upper()
                 
-                # 除外フィルタ
-                if "TAPE" in desc or "GLUE" in desc: continue
+                # 除外フィルタ (Tape/Glue)
+                if "TAPE" in desc_upper or "GLUE" in desc_upper: continue
 
-                child_qty = compute_qty(child, p_qty)
-
-                # Step 2: _CUで終わる場合のCUリスト探索
-                if comp_num.endswith("_CU"):
-                    # 重要: _CU を削除した数字のみで検索
-                    cu_search_key = comp_num.replace("_CU", "")
+                # Step 2: Component Description が "_CU" で終わるか判定
+                if comp_desc.endswith("_CU"):
+                    # その行の Component Number を使って CUリストを検索
+                    cu_search_key = comp_num
                     
                     if cu_df is not None and not cu_df.empty:
+                        # 計算された中間数量（DUベース）
+                        intermediate_qty = compute_qty(child, p_qty)
+                        
                         cu_items = cu_df[cu_df[MASTER_KEY] == cu_search_key]
                         for _, cu_item in cu_items.iterrows():
                             cu_desc = str(cu_item[MASTER_DESC_COL]).upper()
@@ -87,27 +90,25 @@ def create_structured_bom(plan_df, cu_df, du_df):
                                 structured_data.append({
                                     'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
                                     'Comp Number': cu_item[MASTER_COMP_NUM_COL], 'Comp Name': cu_item[MASTER_DESC_COL],
-                                    'Need Qty': compute_qty(cu_item, child_qty), 'Level': 1
+                                    'Need Qty': compute_qty(cu_item, intermediate_qty), 'Level': 1
                                 })
                 else:
-                    # _CUでない通常のVERP子アイテムを追加
+                    # _CUでない通常のVERP子アイテムをDUから追加
                     if str(child.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
                         structured_data.append({
                             'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
-                            'Comp Number': comp_num, 'Comp Name': child[MASTER_DESC_COL],
-                            'Need Qty': child_qty, 'Level': 1
+                            'Comp Number': comp_num, 'Comp Name': comp_desc,
+                            'Need Qty': compute_qty(child, p_qty), 'Level': 1
                         })
 
     return pd.DataFrame(structured_data)
 
-# --- UI部 ---
-st.set_page_config(page_title="SAP Audit Tool V8", layout="wide")
-st.title("📊 SAP監査レポート (CU検索キー修正版)")
+# --- UI ---
+st.set_page_config(page_title="SAP Audit Tool V9", layout="wide")
+st.title("📊 SAP監査レポート (Description末尾判定版)")
 
 with st.sidebar:
-    st.write("ロジック詳細:")
-    st.write("1. DU内を品目コードで検索")
-    st.write("2. 'XXXXX_CU' が見つかったら 'XXXXX' でCU内を検索")
+    st.info("新ロジック:\n1. DU内で品目コード検索\n2. Nameが'_CU'で終わる行のNumberをキーにCU内を検索")
     cu_file = st.file_uploader("CUリスト", type=["xlsx"])
     du_file = st.file_uploader("DUリスト", type=["xlsx"])
 
@@ -119,7 +120,7 @@ with col2:
 
 if st.button("🔍 レポート作成"):
     if not (cu_file and du_file and old_file and new_file):
-        st.error("全ファイルをアップロードしてください")
+        st.error("ファイルをすべてアップロードしてください")
     else:
         try:
             cu_m = pd.read_excel(cu_file)
@@ -140,6 +141,7 @@ if st.button("🔍 レポート作成"):
                     df = pd.merge(old_bom, new_bom, on=m_keys, how='outer', suffixes=('_旧', '_新'))
                     df.fillna({'Need Qty_旧': 0, 'Need Qty_新': 0}, inplace=True)
                     
+                    # 並び替え用の一時列
                     df['Prod_C'] = df['Product Code_旧'].fillna(df['Product Code_新'])
                     df['Lvl_S'] = df['Level_新'].fillna(df['Level_旧'])
                     df = df.sort_values(['Prod_C', 'Start Date', 'Parent Mat', 'Lvl_S'])
@@ -155,7 +157,7 @@ if st.button("🔍 レポート作成"):
                         if abs(r[idx_o] - r[idx_n]) > 0.1:
                             ws.set_row(i + 1, None, red_format)
 
-            st.success("作成完了。CUリストのアイテムが含まれているか確認してください。")
-            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_Final_CU_Fixed.xlsx")
+            st.success("作成完了。CUリストのアイテムが抽出されているか確認してください。")
+            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_DescriptionSearch.xlsx")
         except Exception as e:
             st.error(f"システムエラー: {e}")
