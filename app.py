@@ -40,7 +40,7 @@ def compute_qty(row, plan_qty):
 def create_structured_bom(plan_df, cu_df, du_df):
     if plan_df.empty: return pd.DataFrame()
 
-    # マスタの前処理
+    # マスタのクリーニング
     for df in [cu_df, du_df]:
         if df is not None and not df.empty:
             df[MASTER_KEY] = df[MASTER_KEY].astype(str).str.strip()
@@ -66,26 +66,29 @@ def create_structured_bom(plan_df, cu_df, du_df):
                 comp_num = child[MASTER_COMP_NUM_COL]
                 desc = str(child[MASTER_DESC_COL]).upper()
                 
-                # 除外フィルタ (Tape/Glue)
+                # 除外フィルタ
                 if "TAPE" in desc or "GLUE" in desc: continue
 
-                # 子の数量計算
                 child_qty = compute_qty(child, p_qty)
 
-                # Step 2: _CUで終わる場合はCUリストをさらに検索
-                if comp_num.endswith("_CU") and cu_df is not None and not cu_df.empty:
-                    cu_items = cu_df[cu_df[MASTER_KEY] == comp_num]
-                    for _, cu_item in cu_items.iterrows():
-                        cu_desc = str(cu_item[MASTER_DESC_COL]).upper()
-                        if "TAPE" in cu_desc or "GLUE" in cu_desc: continue
-                        
-                        # VERPのみ追加
-                        if str(cu_item.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
-                            structured_data.append({
-                                'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
-                                'Comp Number': cu_item[MASTER_COMP_NUM_COL], 'Comp Name': cu_item[MASTER_DESC_COL],
-                                'Need Qty': compute_qty(cu_item, child_qty), 'Level': 1
-                            })
+                # Step 2: _CUで終わる場合のCUリスト探索
+                if comp_num.endswith("_CU"):
+                    # 重要: _CU を削除した数字のみで検索
+                    cu_search_key = comp_num.replace("_CU", "")
+                    
+                    if cu_df is not None and not cu_df.empty:
+                        cu_items = cu_df[cu_df[MASTER_KEY] == cu_search_key]
+                        for _, cu_item in cu_items.iterrows():
+                            cu_desc = str(cu_item[MASTER_DESC_COL]).upper()
+                            if "TAPE" in cu_desc or "GLUE" in cu_desc: continue
+                            
+                            # VERPのみ追加
+                            if str(cu_item.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
+                                structured_data.append({
+                                    'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
+                                    'Comp Number': cu_item[MASTER_COMP_NUM_COL], 'Comp Name': cu_item[MASTER_DESC_COL],
+                                    'Need Qty': compute_qty(cu_item, child_qty), 'Level': 1
+                                })
                 else:
                     # _CUでない通常のVERP子アイテムを追加
                     if str(child.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
@@ -97,15 +100,14 @@ def create_structured_bom(plan_df, cu_df, du_df):
 
     return pd.DataFrame(structured_data)
 
-# --- UI部 (前回の修正を維持) ---
-st.set_page_config(page_title="SAP Audit Tool V7", layout="wide")
-st.title("📊 SAP監査レポート (DU->CU 2段階探索版)")
+# --- UI部 ---
+st.set_page_config(page_title="SAP Audit Tool V8", layout="wide")
+st.title("📊 SAP監査レポート (CU検索キー修正版)")
 
 with st.sidebar:
-    st.write("探索設定:")
-    st.write("- DUの品目コードから子を検索")
-    st.write("- _CU品目がある場合はCU内を再検索")
-    st.write("- Tape / Glue は除外")
+    st.write("ロジック詳細:")
+    st.write("1. DU内を品目コードで検索")
+    st.write("2. 'XXXXX_CU' が見つかったら 'XXXXX' でCU内を検索")
     cu_file = st.file_uploader("CUリスト", type=["xlsx"])
     du_file = st.file_uploader("DUリスト", type=["xlsx"])
 
@@ -117,7 +119,7 @@ with col2:
 
 if st.button("🔍 レポート作成"):
     if not (cu_file and du_file and old_file and new_file):
-        st.error("ファイルをすべてアップロードしてください")
+        st.error("全ファイルをアップロードしてください")
     else:
         try:
             cu_m = pd.read_excel(cu_file)
@@ -153,7 +155,7 @@ if st.button("🔍 レポート作成"):
                         if abs(r[idx_o] - r[idx_n]) > 0.1:
                             ws.set_row(i + 1, None, red_format)
 
-            st.success("レポート作成完了")
-            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_DU_CU_DeepSearch.xlsx")
+            st.success("作成完了。CUリストのアイテムが含まれているか確認してください。")
+            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_Final_CU_Fixed.xlsx")
         except Exception as e:
             st.error(f"システムエラー: {e}")
