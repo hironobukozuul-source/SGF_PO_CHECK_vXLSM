@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import io
+import math
 
-# --- 定義 ---
+# --- カラム・設定定義 ---
 PLAN_MAT_COL = "品目コード"
 PLAN_PROD_COL = "製品記号"
 PLAN_START_COL = "製造開始日"
@@ -13,6 +14,9 @@ MASTER_COMP_NUM_COL = "Component Number"
 MASTER_DESC_COL = "Component Description"
 MATERIAL_TYPE_COL = "Material Type"
 TARGET_TYPE = "VERP"
+
+# 除外キーワードリスト
+EXCLUDE_KEYWORDS = ["TAPE", "GLUE", "INK", "SOLVENT"]
 
 def get_plan_data(uploaded_file):
     if uploaded_file is None: return {}
@@ -29,13 +33,27 @@ def get_plan_data(uploaded_file):
     return plans_dict
 
 def compute_qty(row, plan_qty):
+    """数量計算と切り上げ処理"""
     desc = str(row.get(MASTER_DESC_COL, '')).upper()
+    
+    # 数量算出ロジック
     if "BOTTLE" in desc or "PUMP" in desc:
-        return plan_qty
-    p_qty = row.get("Parent Material Quantity", 1)
-    c_qty = row.get("Component Quantity", 0)
-    if pd.isna(p_qty) or p_qty == 0: return 0
-    return (plan_qty / p_qty) * c_qty
+        base_qty = plan_qty
+    else:
+        p_qty = row.get("Parent Material Quantity", 1)
+        c_qty = row.get("Component Quantity", 0)
+        if pd.isna(p_qty) or p_qty == 0: 
+            base_qty = 0
+        else:
+            base_qty = (plan_qty / p_qty) * c_qty
+    
+    # 小数点以下を切り上げて整数にする
+    return math.ceil(base_qty)
+
+def is_excluded(description):
+    """名称に除外キーワードが含まれているか判定"""
+    desc_upper = str(description).upper()
+    return any(kw in desc_upper for kw in EXCLUDE_KEYWORDS)
 
 def create_structured_bom(plan_df, cu_df, du_df):
     if plan_df.empty: return pd.DataFrame()
@@ -53,10 +71,10 @@ def create_structured_bom(plan_df, cu_df, du_df):
         p_mat = str(row[PLAN_MAT_COL]).strip()
         p_qty = row[PLAN_QTY_COL]
         
-        # 1. 親行
+        # 1. 親行の追加
         structured_data.append({
             'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
-            'Comp Number': p_mat, 'Comp Name': "(Parent Item)", 'Need Qty': p_qty, 'Level': 0
+            'Comp Number': p_mat, 'Comp Name': "(Parent Item)", 'Need Qty': math.ceil(p_qty), 'Level': 0
         })
 
         # 2. DUリストからの探索 (Step 1)
@@ -66,24 +84,21 @@ def create_structured_bom(plan_df, cu_df, du_df):
             for _, child in du_children.iterrows():
                 comp_num = child[MASTER_COMP_NUM_COL]
                 comp_desc = child[MASTER_DESC_COL]
-                desc_upper = comp_desc.upper()
                 
-                # 除外フィルタ (Tape/Glue)
-                if "TAPE" in desc_upper or "GLUE" in desc_upper: continue
+                # 除外フィルタ適用
+                if is_excluded(comp_desc): continue
 
                 # Step 2: Component Description が "_CU" で終わるか判定
                 if comp_desc.endswith("_CU"):
-                    # その行の Component Number を使って CUリストを検索
                     cu_search_key = comp_num
                     
                     if cu_df is not None and not cu_df.empty:
-                        # 計算された中間数量（DUベース）
+                        # 中間数量（DUベース）も念のため切り上げ
                         intermediate_qty = compute_qty(child, p_qty)
                         
                         cu_items = cu_df[cu_df[MASTER_KEY] == cu_search_key]
                         for _, cu_item in cu_items.iterrows():
-                            cu_desc = str(cu_item[MASTER_DESC_COL]).upper()
-                            if "TAPE" in cu_desc or "GLUE" in cu_desc: continue
+                            if is_excluded(cu_item[MASTER_DESC_COL]): continue
                             
                             # VERPのみ追加
                             if str(cu_item.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
@@ -93,7 +108,7 @@ def create_structured_bom(plan_df, cu_df, du_df):
                                     'Need Qty': compute_qty(cu_item, intermediate_qty), 'Level': 1
                                 })
                 else:
-                    # _CUでない通常のVERP子アイテムをDUから追加
+                    # 通常のVERP子アイテムをDUから追加
                     if str(child.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
                         structured_data.append({
                             'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
@@ -103,12 +118,14 @@ def create_structured_bom(plan_df, cu_df, du_df):
 
     return pd.DataFrame(structured_data)
 
-# --- UI ---
-st.set_page_config(page_title="SAP Audit Tool V9", layout="wide")
-st.title("📊 SAP監査レポート (Description末尾判定版)")
+# --- UI部 ---
+st.set_page_config(page_title="SAP Audit Tool V11", layout="wide")
+st.title("📊 SAP監査レポート (数量切り上げ対応)")
 
 with st.sidebar:
-    st.info("新ロジック:\n1. DU内で品目コード検索\n2. Nameが'_CU'で終わる行のNumberをキーにCU内を検索")
+    st.header("計算ルール")
+    st.write("- 数量はすべて**整数に切り上げ**")
+    st.write("- 除外: Ink, Solvent, Tape, Glue")
     cu_file = st.file_uploader("CUリスト", type=["xlsx"])
     du_file = st.file_uploader("DUリスト", type=["xlsx"])
 
@@ -141,7 +158,6 @@ if st.button("🔍 レポート作成"):
                     df = pd.merge(old_bom, new_bom, on=m_keys, how='outer', suffixes=('_旧', '_新'))
                     df.fillna({'Need Qty_旧': 0, 'Need Qty_新': 0}, inplace=True)
                     
-                    # 並び替え用の一時列
                     df['Prod_C'] = df['Product Code_旧'].fillna(df['Product Code_新'])
                     df['Lvl_S'] = df['Level_新'].fillna(df['Level_旧'])
                     df = df.sort_values(['Prod_C', 'Start Date', 'Parent Mat', 'Lvl_S'])
@@ -154,10 +170,11 @@ if st.button("🔍 レポート作成"):
                     cols = df.columns.tolist()
                     idx_o, idx_n = cols.index('Need Qty_旧'), cols.index('Need Qty_新')
                     for i, r in enumerate(df.itertuples(index=False)):
-                        if abs(r[idx_o] - r[idx_n]) > 0.1:
+                        # 整数同士の比較
+                        if abs(r[idx_o] - r[idx_n]) >= 1:
                             ws.set_row(i + 1, None, red_format)
 
-            st.success("作成完了。CUリストのアイテムが抽出されているか確認してください。")
-            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_DescriptionSearch.xlsx")
+            st.success("作成完了（数量は整数に切り上げ済み）")
+            st.download_button("📥 ダウンロード", output.getvalue(), "SAP_Audit_Rounded.xlsx")
         except Exception as e:
             st.error(f"システムエラー: {e}")
