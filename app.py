@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import math
 
-# --- 設定定義 [cite: 5, 7, 8, 10, 12] ---
+# --- カラム・設定定義 [cite: 7, 8, 9, 10, 12] ---
 PLAN_MAT_COL = "品目コード"
 PLAN_PROD_COL = "製品記号"
 PLAN_START_COL = "製造開始日"
@@ -43,7 +43,7 @@ def compute_qty(row, plan_qty):
     return math.ceil(base_qty)
 
 def is_excluded(description):
-    """除外キーワード判定 [cite: 12]"""
+    """名称に除外キーワードが含まれているか判定 [cite: 12]"""
     desc_upper = str(description).upper()
     return any(kw in desc_upper for kw in EXCLUDE_KEYWORDS)
 
@@ -53,15 +53,18 @@ def create_structured_bom(plan_df, cu_m, du_m):
     if plan_df.empty: return pd.DataFrame(columns=cols), set()
 
     structured_data = []
-    missing_mats = set() # 見つからなかった品目を格納
+    missing_info = set() # 「製品記号: 品目コード」の形式で格納
 
     for _, row in plan_df.iterrows():
         p_mat = str(row[PLAN_MAT_COL]).strip()
+        p_prod = str(row[PLAN_PROD_COL]).strip()
         p_qty = row[PLAN_QTY_COL]
         
-        # Level 0 追加
+        error_prefix = f"[{p_prod}] {p_mat}"
+        
+        # Level 0 (Parent)
         structured_data.append({
-            'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
+            'Parent Mat': p_mat, 'Product Code': p_prod, 'Start Date': row[PLAN_START_COL],
             'Comp Number': p_mat, 'Comp Name': "(Parent Item)", 'Need Qty': math.ceil(p_qty), 'Level': 0
         })
 
@@ -69,7 +72,7 @@ def create_structured_bom(plan_df, cu_m, du_m):
         du_children = du_m[du_m[MASTER_KEY] == p_mat]
         
         if du_children.empty:
-            missing_mats.add(p_mat) # DUリストに親品目がない場合
+            missing_info.add(f"{error_prefix} (DUリストに未登録)")
             continue
 
         found_verp = False
@@ -85,14 +88,15 @@ def create_structured_bom(plan_df, cu_m, du_m):
                 cu_items = cu_m[cu_m[MASTER_KEY] == comp_num]
                 
                 if cu_items.empty:
-                    missing_mats.add(f"{p_mat} (CU: {comp_num} 不足)")
+                    missing_info.add(f"{error_prefix} (CU: {comp_num} の詳細がCUリストに不足)")
                     continue
 
                 for _, cu_item in cu_items.iterrows():
                     if is_excluded(cu_item[MASTER_DESC_COL]): continue
+                    # VERP判定 [cite: 10]
                     if str(cu_item.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
                         structured_data.append({
-                            'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
+                            'Parent Mat': p_mat, 'Product Code': p_prod, 'Start Date': row[PLAN_START_COL],
                             'Comp Number': cu_item[MASTER_COMP_NUM_COL], 'Comp Name': cu_item[MASTER_DESC_COL],
                             'Need Qty': compute_qty(cu_item, intermediate_qty), 'Level': 1
                         })
@@ -100,26 +104,25 @@ def create_structured_bom(plan_df, cu_m, du_m):
             else:
                 if str(child.get(MATERIAL_TYPE_COL)) == TARGET_TYPE:
                     structured_data.append({
-                        'Parent Mat': p_mat, 'Product Code': row[PLAN_PROD_COL], 'Start Date': row[PLAN_START_COL],
+                        'Parent Mat': p_mat, 'Product Code': p_prod, 'Start Date': row[PLAN_START_COL],
                         'Comp Number': comp_num, 'Comp Name': comp_desc,
                         'Need Qty': compute_qty(child, p_qty), 'Level': 1
                     })
                     found_verp = True
         
-        # VERPが1つも見つからなかった場合（除外分を除く）
         if not found_verp:
-            missing_mats.add(f"{p_mat} (対象VERPなし)")
+            missing_info.add(f"{error_prefix} (対象VERPが見つかりません)")
 
-    return pd.DataFrame(structured_data), missing_mats
+    return pd.DataFrame(structured_data), missing_info
 
-# --- UI ---
+# --- UI [cite: 21, 22] ---
 st.set_page_config(page_title="SAP Audit Tool V12", layout="wide")
-st.title("📊 SAP監査レポート作成 (エラー表示機能付)")
+st.title("📊 SAP監査レポート作成 (製品記号付きエラー表示)")
 
 with st.sidebar:
     st.header("1. マスターデータ設定")
-    cu_file = st.file_uploader("CUリスト", type=["xlsx"])
-    du_file = st.file_uploader("DUリスト", type=["xlsx"])
+    cu_file = st.file_uploader("CUリスト (xlsx)", type=["xlsx"])
+    du_file = st.file_uploader("DUリスト (xlsx)", type=["xlsx"])
 
 st.header("2. 計画ファイル比較")
 c1, c2 = st.columns(2)
@@ -128,12 +131,12 @@ with c2: new_file = st.file_uploader("新計画", type=["xlsm", "xlsx"])
 
 if st.button("🔍 レポート作成"):
     if not (cu_file and du_file and old_file and new_file):
-        st.error("ファイルをすべてアップロードしてください")
+        st.error("すべてのファイルをアップロードしてください")
     else:
         try:
+            # データの読み込み
             cu_m = pd.read_excel(cu_file).astype(str)
             du_m = pd.read_excel(du_file).astype(str)
-            # 数量計算用のカラムのみ数値変換
             for m in [cu_m, du_m]:
                 for c in ["Parent Material Quantity", "Component Quantity"]:
                     if c in m.columns: m[c] = pd.to_numeric(m[c], errors='coerce').fillna(0)
@@ -146,7 +149,7 @@ if st.button("🔍 レポート作成"):
             all_errors = set()
 
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                red_format = writer.book.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+                red_format = writer.book.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}) # [cite: 19]
                 
                 for name in all_names:
                     old_bom, err_o = create_structured_bom(old_plans.get(name, pd.DataFrame()), cu_m, du_m)
@@ -159,7 +162,7 @@ if st.button("🔍 レポート作成"):
                     if df.empty: continue
                     df.fillna({'Need Qty_旧': 0, 'Need Qty_新': 0}, inplace=True)
                     
-                    # ソート処理 [cite: 20]
+                    # ソート [cite: 20]
                     df['P_S'] = df['Product Code_旧'].fillna(df['Product Code_新'])
                     df['L_S'] = df['Level_新'].fillna(df['Level_旧'])
                     df = df.sort_values(['P_S', 'Start Date', 'Parent Mat', 'L_S']).drop(columns=['P_S', 'L_S'])
@@ -167,7 +170,7 @@ if st.button("🔍 レポート作成"):
                     sheet_name = str(name)[:31].translate(str.maketrans("", "", r"[]:*?/\\"))
                     df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-                    # ハイライト適用 [cite: 19]
+                    # 差異がある行を赤くハイライト [cite: 19]
                     ws = writer.sheets[sheet_name]
                     cols = df.columns.tolist()
                     idx_o, idx_n = cols.index('Need Qty_旧'), cols.index('Need Qty_新')
@@ -177,14 +180,14 @@ if st.button("🔍 レポート作成"):
 
             # エラー表示エリア
             if all_errors:
-                st.warning("⚠️ 以下の品目はマスターデータ（DU/CU）で見つからなかったか、対象外でした：")
+                st.warning("⚠️ マスターデータ不備：以下の [製品記号] 品目コード は構成を確認できませんでした")
                 st.code("\n".join(sorted(all_errors)))
 
             st.success("レポート作成が完了しました。")
             st.download_button(
-                label="📥 ダウンロード: プラン変更_PO確認.xlsx [cite: 18]",
+                label="📥 ダウンロード: プラン変更_PO確認.xlsx",
                 data=output.getvalue(),
-                file_name="プラン変更_PO確認.xlsx",
+                file_name="プラン変更_PO確認.xlsx", # [cite: 18]
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         except Exception as e:
